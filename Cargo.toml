@@ -18,7 +18,7 @@ once_cell = "1.20.2"
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-openssl = "0.3.0"
-sd-notify = "0.4"
+sd-notify = "0.5"
 tokio = { version = "1.41", features = [
   "rt-multi-thread",
   "net",
