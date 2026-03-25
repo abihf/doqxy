@@ -1,11 +1,3 @@
-use std::{
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    },
-    time::{Duration, Instant},
-};
 use anyhow::{Context, Result};
 use hickory_proto::{
     op::{Message, ResponseCode},
@@ -22,6 +14,14 @@ use moka::future::Cache;
 use once_cell::sync::OnceCell;
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::WebPkiServerVerifier;
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
 use tokio::{net::UdpSocket, sync::RwLock, time::timeout};
 use tracing::{debug, error, info, warn};
 
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
 
     // Create DNS proxy
     let proxy = DnsProxy::new().await?;
-    if let Err(err) = sd_notify::notify( &[sd_notify::NotifyState::Ready]) {
+    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         warn!("Failed to notify systemd readiness: {}", err);
     }
     proxy.run().await;
@@ -386,7 +386,6 @@ impl ConnectionManager {
         self.bootstrap_dns = Some(addr);
         self
     }
-
 
     async fn is_connected(&self) -> bool {
         let conn_guard = self.connection.read().await;
