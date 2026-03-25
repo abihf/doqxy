@@ -6,13 +6,13 @@
   "configurations": [
 
     {
-      "name": "Debug executable 'quicdns'",
+      "name": "Debug executable 'doqxy'",
       "type": "lldb",
       "request": "launch",
       "cargo": {
         "args": [
           "run",
-          "--bin=quicdns"
+          "--bin=doqxy"
         ]
       },
       "envFile": ".env",

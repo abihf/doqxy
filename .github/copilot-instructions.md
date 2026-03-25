@@ -1,7 +1,7 @@
-# QuicDNS AI Agent Instructions
+# Doqxy AI Agent Instructions
 
 ## Project Overview
-**quicdns** is a high-performance DNS proxy that forwards UDP DNS queries to a DNS-over-QUIC (DoQ) upstream server (RFC 9250). Key design: single QUIC connection with multiplexed streams, minimal parsing in production mode, and aggressive caching.
+**doqxy** is a high-performance DNS proxy that forwards UDP DNS queries to a DNS-over-QUIC (DoQ) upstream server (RFC 9250). Key design: single QUIC connection with multiplexed streams, minimal parsing in production mode, and aggressive caching.
 
 ## Architecture Principles
 
@@ -87,14 +87,14 @@ nslookup example.com 127.0.0.53
 ### Systemd Service
 - Uses `DynamicUser=true` for security (ephemeral user)
 - Requires `CAP_NET_BIND_SERVICE` to bind port 53 without root
-- Service file generated from [quicdns.service.in](../quicdns.service.in) with `@BIN_DIR@` substitution
-- Edit config: `sudo systemctl edit quicdns.service`
+- Service file generated from [doqxy.service.in](../doqxy.service.in) with `@BIN_DIR@` substitution
+- Edit config: `sudo systemctl edit doqxy.service`
 
 ### Installation
 ```bash
 sudo make install         # Installs to /usr/local/bin
-sudo systemctl enable --now quicdns.service
-journalctl -u quicdns -f  # View logs
+sudo systemctl enable --now doqxy.service
+journalctl -u doqxy -f  # View logs
 ```
 
 ## Dependencies

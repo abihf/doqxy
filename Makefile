@@ -4,29 +4,29 @@ SERVICE_DIR=/usr/lib/systemd/system
 TARGET=
 PROFILE=native
 
-target/release/quicdns: src/main.rs Cargo.toml Cargo.lock
+target/release/doqxy: src/main.rs Cargo.toml Cargo.lock
 	cargo build --release
 
-target/native/quicdns: src/main.rs Cargo.toml Cargo.lock
+target/native/doqxy: src/main.rs Cargo.toml Cargo.lock
 	RUSTFLAGS="-C target-cpu=native" cargo build --profile native
 
-target/quicdns.service: quicdns.service.in
-	sed "s|@BIN_DIR@|$(BIN_DIR)|g" quicdns.service.in > target/quicdns.service
+target/doqxy.service: doqxy.service.in
+	sed "s|@BIN_DIR@|$(BIN_DIR)|g" doqxy.service.in > target/doqxy.service
 
 .PHONY: build install clean uninstall
 
-build-bin: target/$(PROFILE)/quicdns
-build-service: target/quicdns.service
+build-bin: target/$(PROFILE)/doqxy
+build-service: target/doqxy.service
 build: build-bin build-service
 
 install-bin: build
-	install -m 755 target/$(PROFILE)/quicdns $(TARGET)$(BIN_DIR)/quicdns
+	install -m 755 target/$(PROFILE)/doqxy $(TARGET)$(BIN_DIR)/doqxy
 install-service: build-service
-	install -m 644 target/quicdns.service $(TARGET)$(SERVICE_DIR)/quicdns.service
+	install -m 644 target/doqxy.service $(TARGET)$(SERVICE_DIR)/doqxy.service
 install: install-bin install-service
 
 clean:
-	rm -f target/release/quicdns target/native/quicdns target/quicdns.service
+	rm -f target/release/doqxy target/native/doqxy target/doqxy.service
 
 fmt:
 	cargo fmt --all
@@ -39,5 +39,5 @@ check: lint
 	cargo check --all
 
 uninstall:
-	rm $(TARGET)$(BIN_DIR)/quicdns
-	rm $(TARGET)$(SERVICE_DIR)/quicdns.service
+	rm $(TARGET)$(BIN_DIR)/doqxy
+	rm $(TARGET)$(SERVICE_DIR)/doqxy.service

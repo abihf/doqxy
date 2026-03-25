@@ -10,12 +10,12 @@ sudo make install
 
 This will:
 - Build the binary with native CPU optimizations
-- Install binary to `/usr/local/bin/quicdns`
-- Install systemd service to `/usr/lib/systemd/system/quicdns.service`
+- Install binary to `/usr/local/bin/doqxy`
+- Install systemd service to `/usr/lib/systemd/system/doqxy.service`
 
 2. Configure environment variables (optional):
 ```bash
-sudo systemctl edit quicdns.service
+sudo systemctl edit doqxy.service
 ```
 
 Add your custom configuration:
@@ -31,21 +31,21 @@ Environment="DEBUG=1"
 3. Enable and start the service:
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable quicdns.service
-sudo systemctl start quicdns.service
+sudo systemctl enable doqxy.service
+sudo systemctl start doqxy.service
 ```
 
 4. Check status:
 ```bash
-systemctl status quicdns.service
-journalctl -u quicdns -f
+systemctl status doqxy.service
+journalctl -u doqxy -f
 ```
 
 ## Uninstall
 
 ```bash
-sudo systemctl stop quicdns.service
-sudo systemctl disable quicdns.service
+sudo systemctl stop doqxy.service
+sudo systemctl disable doqxy.service
 sudo make uninstall
 ```
 

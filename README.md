@@ -1,4 +1,4 @@
-# quicdns
+# doqxy
 
 A high-performance DNS proxy with DNS-over-QUIC (DoQ) support, written in Rust.
 
@@ -33,7 +33,7 @@ Quick install:
 ```bash
 make build
 sudo make install
-sudo systemctl enable --now quicdns.service
+sudo systemctl enable --now doqxy.service
 ```
 
 ## Configuration
@@ -52,7 +52,7 @@ Configuration is done via environment variables:
 
 Edit the systemd service:
 ```bash
-sudo systemctl edit quicdns.service
+sudo systemctl edit doqxy.service
 ```
 
 Add custom environment variables:
@@ -71,16 +71,16 @@ Environment="DEBUG=0"
 
 ```bash
 # Start the service
-sudo systemctl start quicdns.service
+sudo systemctl start doqxy.service
 
 # Check status
-systemctl status quicdns.service
+systemctl status doqxy.service
 
 # View logs
-journalctl -u quicdns -f
+journalctl -u doqxy -f
 
 # Stop the service
-sudo systemctl stop quicdns.service
+sudo systemctl stop doqxy.service
 ```
 
 ### Testing
@@ -114,7 +114,7 @@ cargo run --release
 
 ### Disable NetworkManager DNS Management
 
-If you want to use quicdns as your system DNS resolver, you need to prevent NetworkManager from managing `/etc/resolv.conf`:
+If you want to use doqxy as your system DNS resolver, you need to prevent NetworkManager from managing `/etc/resolv.conf`:
 
 1. Create NetworkManager configuration:
 ```bash
@@ -156,7 +156,7 @@ sudo chattr +i /etc/resolv.conf
 sudo chattr -i /etc/resolv.conf
 ```
 
-**Note**: Make sure quicdns is running and bound to the address specified in `/etc/resolv.conf` before making these changes.
+**Note**: Make sure doqxy is running and bound to the address specified in `/etc/resolv.conf` before making these changes.
 
 ## Security
 

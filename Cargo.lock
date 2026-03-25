@@ -159,6 +159,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "doqxy"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "hickory-proto",
+ "hickory-resolver",
+ "moka",
+ "once_cell",
+ "quinn",
+ "rustls",
+ "rustls-openssl",
+ "sd-notify",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "webpki-roots",
+]
+
+[[package]]
 name = "enum-as-inner"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -841,26 +861,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "quicdns"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "hickory-proto",
- "hickory-resolver",
- "moka",
- "once_cell",
- "quinn",
- "rustls",
- "rustls-openssl",
- "sd-notify",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "webpki-roots",
 ]
 
 [[package]]

@@ -1,10 +1,10 @@
 [package]
-name = "quicdns"
-version = "0.1.0"
+name = "doqxy"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "A high-performance DNS proxy with DNS-over-QUIC (DoQ) support"
-repository = "https://github.com/abihf/quicdns"
+repository = "https://github.com/abihf/doqxy"
 keywords = ["dns", "quic", "proxy", "dns-over-quic", "doq"]
 categories = ["network-programming"]
 

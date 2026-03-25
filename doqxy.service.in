@@ -7,7 +7,7 @@ Requires=network-online.target
 [Service]
 Type=notify
 NotifyAccess=main
-ExecStart=@BIN_DIR@/quicdns
+ExecStart=@BIN_DIR@/doqxy
 Restart=on-failure
 RestartSec=5s
 
@@ -45,7 +45,7 @@ Environment="BIND_ADDR=127.0.0.53:53"
 # Logging
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=quicdns
+SyslogIdentifier=doqxy
 
 [Install]
 WantedBy=multi-user.target
