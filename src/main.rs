@@ -6,7 +6,6 @@ use std::{
     },
     time::{Duration, Instant},
 };
-
 use anyhow::{Context, Result};
 use hickory_proto::{
     op::{Message, ResponseCode},
@@ -39,15 +38,11 @@ async fn main() -> Result<()> {
 
     // Create DNS proxy
     let proxy = DnsProxy::new().await?;
-    notify_systemd_ready();
-    proxy.run().await;
-    Ok(())
-}
-
-fn notify_systemd_ready() {
-    if let Err(err) = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]) {
+    if let Err(err) = sd_notify::notify( &[sd_notify::NotifyState::Ready]) {
         warn!("Failed to notify systemd readiness: {}", err);
     }
+    proxy.run().await;
+    Ok(())
 }
 
 struct DnsProxy {
@@ -148,7 +143,7 @@ impl DnsProxy {
 
         let manager = self.manager.clone(); // Clone the Arc
         tokio::spawn(async move {
-            let _ = manager.connect(true).await;
+            let _ = manager.connect(force_reconnect).await;
         });
     }
 
