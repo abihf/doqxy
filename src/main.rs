@@ -487,8 +487,8 @@ impl ConnectionManager {
                 .open_bi()
                 .await
                 .context("Failed to open test stream on new connection")?;
-            let _ = send.finish()?;
-            let _ = recv.stop(0u32.into())?;
+            send.finish()?;
+            recv.stop(0u32.into())?;
         }
         info!(
             "Successfully connected to upstream DoQ server at {}",
