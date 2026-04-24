@@ -28,7 +28,7 @@ tokio = { version = "1.51", features = [
 ] }
 tracing = "0.1"
 tracing-subscriber = "0.3"
-webpki-roots = "1.0.6"
+webpki-roots = "1.0.7"
 
 [profile.release]
 lto = true
