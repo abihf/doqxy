@@ -209,9 +209,7 @@ impl DnsProxy {
                         Ok(response) => {
                             info!(
                                 "Sending valid response to {} (took {:?}): {:?}",
-                                src_addr,
-                                duration,
-                                response.answers,
+                                src_addr, duration, response.answers,
                             );
                         }
                         Err(e) => {
