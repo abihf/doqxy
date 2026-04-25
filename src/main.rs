@@ -1,14 +1,12 @@
 use anyhow::{Context, Result};
 use hickory_proto::{
-    op::{Message, ResponseCode},
-    runtime::TokioRuntimeProvider,
+    op::{Message, MessageType, ResponseCode},
     serialize::binary::BinEncodable,
-    xfer::Protocol,
 };
 use hickory_resolver::{
     Resolver,
-    config::{NameServerConfig, NameServerConfigGroup, ResolverConfig},
-    name_server::{GenericConnector, TokioConnectionProvider},
+    config::{ConnectionConfig, NameServerConfig, ResolverConfig},
+    net::runtime::TokioRuntimeProvider,
 };
 use moka::future::Cache;
 use once_cell::sync::OnceCell;
@@ -29,7 +27,7 @@ const BUFFER_SIZE: usize = 4096;
 const CACHE_MAX_CAPACITY: u64 = 10000;
 const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
-static RESOLVER: OnceCell<Resolver<GenericConnector<TokioRuntimeProvider>>> = OnceCell::new();
+static RESOLVER: OnceCell<Resolver<TokioRuntimeProvider>> = OnceCell::new();
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -151,7 +149,7 @@ impl DnsProxy {
         if self.debug_mode {
             // Parse query for debugging
             if let Ok(query) = Message::from_vec(&query_data) {
-                info!("Received query from {}: {:?}", src_addr, query.queries());
+                info!("Received query from {}: {:?}", src_addr, query.queries);
             } else {
                 error!("Received invalid DNS query from {}", src_addr);
                 send_servfail_raw(&query_data, &self.socket, src_addr).await;
@@ -213,7 +211,7 @@ impl DnsProxy {
                                 "Sending valid response to {} (took {:?}): {:?}",
                                 src_addr,
                                 duration,
-                                response.answers(),
+                                response.answers,
                             );
                         }
                         Err(e) => {
@@ -248,9 +246,7 @@ impl DnsProxy {
                         "Timeout circuit breaker tripped after {} timeouts; reconnecting",
                         timeout_count
                     );
-                    if !self.manager.is_connecting() {
-                        self.force_reconnect.store(true, Ordering::Relaxed);
-                    }
+                    self.force_reconnect.store(true, Ordering::Relaxed);
                 }
             }
         }
@@ -503,16 +499,18 @@ async fn resolve_upstream_addr(
     bootstrap_dns: Option<SocketAddr>,
 ) -> Result<Vec<IpAddr>> {
     let server = bootstrap_dns.unwrap_or_else(|| "1.1.1.1:53".parse().unwrap());
-    let resolver = RESOLVER.get_or_init(move || {
-        let mut ns = NameServerConfigGroup::with_capacity(1);
-        ns.push(NameServerConfig::new(server, Protocol::Udp));
+    let resolver = RESOLVER.get_or_try_init(move || {
+        let mut udp = ConnectionConfig::udp();
+        udp.port = server.port();
+        let ns = NameServerConfig::new(server.ip(), true, vec![udp]);
 
         Resolver::builder_with_config(
-            ResolverConfig::from_parts(None, vec![], ns),
-            TokioConnectionProvider::default(),
+            ResolverConfig::from_parts(None, vec![], vec![ns]),
+            TokioRuntimeProvider::default(),
         )
         .build()
-    });
+        .context("failed to build bootstrap resolver")
+    })?;
 
     let response = resolver
         .lookup_ip(host)
@@ -533,14 +531,11 @@ async fn resolve_upstream_addr(
 
 async fn send_servfail(query: &Message, socket: &UdpSocket, src_addr: SocketAddr) {
     // Create SERVFAIL response
-    let mut response = Message::new();
-    response.set_id(query.id());
-    response.set_message_type(hickory_proto::op::MessageType::Response);
-    response.set_op_code(query.op_code());
-    response.set_response_code(ResponseCode::ServFail);
+    let mut response = Message::new(query.id, MessageType::Response, query.op_code);
+    response.metadata.response_code = ResponseCode::ServFail;
 
     // Copy questions from query
-    for question in query.queries() {
+    for question in &query.queries {
         response.add_query(question.clone());
     }
 
