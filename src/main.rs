@@ -237,14 +237,16 @@ impl DnsProxy {
                 warn!("Query timeout after 5 seconds for {}", src_addr);
                 send_servfail_raw(&query_data, &self.socket, src_addr).await;
 
-                let timeout_count = self.timeout_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if timeout_count > 5 {
-                    self.timeout_count.store(0, Ordering::Relaxed);
-                    warn!(
-                        "Timeout circuit breaker tripped after {} timeouts; reconnecting",
-                        timeout_count
-                    );
-                    self.force_reconnect.store(true, Ordering::Relaxed);
+                if !self.manager.is_connecting() {
+                    let timeout_count = self.timeout_count.fetch_add(1, Ordering::Relaxed) + 1;
+                    if timeout_count > 5 {
+                        self.timeout_count.store(0, Ordering::Relaxed);
+                        warn!(
+                            "Timeout circuit breaker tripped after {} timeouts; reconnecting",
+                            timeout_count
+                        );
+                        self.force_reconnect.store(true, Ordering::Relaxed);
+                    }
                 }
             }
         }
@@ -413,7 +415,7 @@ impl ConnectionManager {
     }
 
     async fn connect(&self, force: bool) -> Result<Connection> {
-        self.connecting.store(true, Ordering::Relaxed);
+        let _connecting = set_flag_guard(&self.connecting);
 
         // Need to establish new connection
         let mut conn_guard = self.connection.write().await;
@@ -439,7 +441,6 @@ impl ConnectionManager {
                 Ok(Ok(connection)) => {
                     info!("Connected to DoQ server at {}", remote_addr);
                     *conn_guard = Some(connection.clone());
-                    self.connecting.store(false, Ordering::Relaxed);
                     return Ok(connection);
                 }
                 Ok(Err(e)) => {
@@ -451,7 +452,6 @@ impl ConnectionManager {
             }
         }
 
-        self.connecting.store(false, Ordering::Relaxed);
         Err(anyhow::anyhow!(
             "Failed to connect to any resolved IP addresses: {:?}",
             remote_ips
@@ -559,5 +559,20 @@ async fn send_servfail_raw(query_data: &[u8], socket: &UdpSocket, src_addr: Sock
             "Failed to parse query for SERVFAIL, cannot respond to {}",
             src_addr
         );
+    }
+}
+
+struct BoolGuard<'a> {
+    flag: &'a AtomicBool,
+}
+
+fn set_flag_guard<'a>(flag: &'a AtomicBool) -> BoolGuard<'a> {
+    flag.store(true, Ordering::Relaxed);
+    BoolGuard { flag }
+}
+
+impl<'a> Drop for BoolGuard<'a> {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Relaxed);
     }
 }
