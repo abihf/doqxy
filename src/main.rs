@@ -50,6 +50,7 @@ struct DnsProxy {
     debug_mode: bool,
     timeout_count: Arc<AtomicUsize>,
     force_reconnect: Arc<AtomicBool>,
+    connection_epoch: Arc<AtomicUsize>,
 }
 
 impl DnsProxy {
@@ -110,6 +111,7 @@ impl DnsProxy {
             debug_mode,
             timeout_count: Arc::new(AtomicUsize::new(0)),
             force_reconnect: Arc::new(AtomicBool::new(false)),
+            connection_epoch: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -139,9 +141,16 @@ impl DnsProxy {
             return;
         }
 
-        let manager = self.manager.clone(); // Clone the Arc
+        let manager = self.manager.clone();
+        let timeout_count = self.timeout_count.clone();
+        let connection_epoch = self.connection_epoch.clone();
         tokio::spawn(async move {
-            let _ = manager.connect(force_reconnect).await;
+            if manager.connect(force_reconnect).await.is_ok() {
+                // Bump epoch so stale timeout handlers from the old connection
+                // don't re-trip the circuit breaker on the new connection.
+                connection_epoch.fetch_add(1, Ordering::Relaxed);
+                timeout_count.store(0, Ordering::Relaxed);
+            }
         });
     }
 
@@ -193,6 +202,10 @@ impl DnsProxy {
             info!("Cache MISS for query from {}", src_addr);
         }
 
+        // Capture the epoch before submitting the query. If the connection is
+        // re-established while this query is in flight, the epoch will increase
+        // and this query's timeout won't re-trip the circuit breaker.
+        let query_epoch = self.connection_epoch.load(Ordering::Relaxed);
         self.ensure_connection_background().await;
 
         // Start timer for processing duration
@@ -237,7 +250,12 @@ impl DnsProxy {
                 warn!("Query timeout after 5 seconds for {}", src_addr);
                 send_servfail_raw(&query_data, &self.socket, src_addr).await;
 
-                if !self.manager.is_connecting() {
+                // Only count timeouts from the current connection epoch.
+                // Stale timeouts from queries that were in flight during a previous
+                // broken connection must not re-trip the circuit breaker after a
+                // successful reconnect has already bumped the epoch.
+                let current_epoch = self.connection_epoch.load(Ordering::Relaxed);
+                if !self.manager.is_connecting() && current_epoch == query_epoch {
                     let timeout_count = self.timeout_count.fetch_add(1, Ordering::Relaxed) + 1;
                     if timeout_count > 5 {
                         self.timeout_count.store(0, Ordering::Relaxed);
