@@ -358,7 +358,6 @@ struct ConnectionManager {
 }
 
 impl ConnectionManager {
-    
     fn new(server_name: String, server_port: u16) -> Result<Self> {
         let provider = Arc::new(rustls_openssl::default_provider());
         let roots = rustls::RootCertStore {
@@ -400,7 +399,11 @@ impl ConnectionManager {
     }
 
     fn with_server_ip(mut self, ip: Vec<IpAddr>) -> Self {
-        self.server_addrs = Some(Arc::new(ip.into_iter().map(|ip| SocketAddr::new(ip, self.server_port)).collect()));
+        self.server_addrs = Some(Arc::new(
+            ip.into_iter()
+                .map(|ip| SocketAddr::new(ip, self.server_port))
+                .collect(),
+        ));
         self
     }
 
@@ -539,7 +542,10 @@ impl ConnectionManager {
             .await
             .context("can not resolve upstream ip")?;
 
-        let ips: Vec<SocketAddr> = response.iter().map(|ip| SocketAddr::new(ip, self.server_port)).collect();
+        let ips: Vec<SocketAddr> = response
+            .iter()
+            .map(|ip| SocketAddr::new(ip, self.server_port))
+            .collect();
         if ips.is_empty() {
             cold_path();
             Err(anyhow::anyhow!(
