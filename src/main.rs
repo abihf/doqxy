@@ -13,6 +13,7 @@ use once_cell::sync::OnceCell;
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::WebPkiServerVerifier;
 use std::{
+    hint::cold_path,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::{
         Arc,
@@ -65,12 +66,6 @@ impl DnsProxy {
         let bind_addr = std::env::var("BIND_ADDR").unwrap_or_else(|_| "127.0.0.53:53".to_string());
         let debug_mode = std::env::var("DEBUG").map(|v| v == "1").unwrap_or(false);
 
-        // Create UDP socket for receiving DNS queries
-        info!("Listening for DNS queries on {}", &bind_addr);
-        let socket = UdpSocket::bind(bind_addr)
-            .await
-            .context("Failed to bind UDP socket")?;
-
         // Create connection manager
         let mut manager = ConnectionManager::new(upstream_server, upstream_port)?;
         if let Ok(ips_string) = std::env::var("UPSTREAM_IP") {
@@ -104,6 +99,13 @@ impl DnsProxy {
             "Cache initialized: max {} entries, TTL {}s",
             CACHE_MAX_CAPACITY, CACHE_TTL_SECS
         );
+
+        // Create UDP socket for receiving DNS queries
+        info!("Listening for DNS queries on {}", &bind_addr);
+        let socket = UdpSocket::bind(bind_addr)
+            .await
+            .context("Failed to bind UDP socket")?;
+
         Ok(Self {
             manager: Arc::new(manager),
             cache: Arc::new(cache),
@@ -117,7 +119,7 @@ impl DnsProxy {
 
     async fn run(self) {
         let proxy = Arc::new(self);
-        let mut buf = vec![0u8; BUFFER_SIZE];
+        let mut buf = [0u8; BUFFER_SIZE];
         loop {
             match proxy.socket.recv_from(&mut buf).await {
                 Ok((len, src_addr)) => {
@@ -125,10 +127,11 @@ impl DnsProxy {
                     let proxy = Arc::clone(&proxy);
 
                     tokio::spawn(async move {
-                        proxy.handle_query(query_data, src_addr).await;
+                        proxy.handle_query(&query_data, src_addr).await;
                     });
                 }
                 Err(e) => {
+                    cold_path();
                     error!("Error receiving UDP packet: {}", e);
                 }
             }
@@ -154,34 +157,34 @@ impl DnsProxy {
         });
     }
 
-    async fn handle_query(&self, query_data: Vec<u8>, src_addr: SocketAddr) {
+    async fn handle_query(&self, query_data: &[u8], src_addr: SocketAddr) {
         if self.debug_mode {
+            cold_path();
             // Parse query for debugging
-            if let Ok(query) = Message::from_vec(&query_data) {
+            if let Ok(query) = Message::from_vec(query_data) {
                 info!("Received query from {}: {:?}", src_addr, query.queries);
             } else {
                 error!("Received invalid DNS query from {}", src_addr);
-                send_servfail_raw(&query_data, &self.socket, src_addr).await;
+                send_servfail_raw(query_data, &self.socket, src_addr).await;
                 return;
             }
         }
 
+        if query_data.len() <= 12 {
+            cold_path();
+            error!("Received DNS query too short from {}", src_addr);
+            send_servfail_raw(query_data, &self.socket, src_addr).await;
+            return;
+        }
+
         // Extract query ID to restore later
-        let query_id = if query_data.len() >= 2 {
-            [query_data[0], query_data[1]]
-        } else {
-            [0, 0]
-        };
+        let query_id = &query_data[0..2];
 
         // Create cache key from question section (skip 12-byte header)
-        let cache_key = if query_data.len() > 12 {
-            query_data[12..].to_vec()
-        } else {
-            query_data.clone()
-        };
+        let cache_key = &query_data[12..];
 
         // Check cache
-        if let Some(mut cached_response) = self.cache.get(&cache_key).await {
+        if let Some(mut cached_response) = self.cache.get(cache_key).await {
             // Replace response ID with query ID
             if cached_response.len() >= 2 {
                 cached_response[0] = query_id[0];
@@ -189,16 +192,19 @@ impl DnsProxy {
             }
 
             if self.debug_mode {
+                cold_path();
                 info!("Cache HIT for query from {}", src_addr);
             }
 
             if let Err(e) = self.socket.send_to(&cached_response, src_addr).await {
+                cold_path();
                 error!("Failed to send cached response to client: {}", e);
             }
             return;
         }
 
         if self.debug_mode {
+            cold_path();
             info!("Cache MISS for query from {}", src_addr);
         }
 
@@ -216,6 +222,7 @@ impl DnsProxy {
             Ok(Ok(response_buf)) => {
                 self.timeout_count.store(0, Ordering::Relaxed);
                 if self.debug_mode {
+                    cold_path();
                     let duration = start_time.elapsed();
                     // Validate and log response in debug mode
                     match Message::from_vec(&response_buf) {
@@ -233,22 +240,23 @@ impl DnsProxy {
                     }
                 }
 
-                // Cache the response (with original query ID)
-                self.cache.insert(cache_key, response_buf.clone()).await;
-
                 // Send response to client
                 if let Err(e) = self.socket.send_to(&response_buf, src_addr).await {
                     error!("Failed to send response to client: {}", e);
                 }
+
+                // Cache the response (with original query ID)
+                self.cache.insert(cache_key.to_vec(), response_buf).await;
             }
             Ok(Err(e)) => {
+                cold_path();
                 self.timeout_count.store(0, Ordering::Relaxed);
                 error!("Error processing query: {}", e);
-                send_servfail_raw(&query_data, &self.socket, src_addr).await;
+                send_servfail_raw(query_data, &self.socket, src_addr).await;
             }
             Err(_) => {
                 warn!("Query timeout after 5 seconds for {}", src_addr);
-                send_servfail_raw(&query_data, &self.socket, src_addr).await;
+                send_servfail_raw(query_data, &self.socket, src_addr).await;
 
                 // Only count timeouts from the current connection epoch.
                 // Stale timeouts from queries that were in flight during a previous
@@ -342,15 +350,15 @@ impl Drop for RecvStreamGuard {
 struct ConnectionManager {
     endpoint: Endpoint,
     server_name: String,
-    server_ip: Option<Vec<IpAddr>>,
     server_port: u16,
     bootstrap_dns: Option<SocketAddr>,
     connection: Arc<RwLock<Option<Connection>>>,
-    // force_reconnect: AtomicBool,
+    server_addrs: Option<Arc<Vec<SocketAddr>>>,
     connecting: AtomicBool,
 }
 
 impl ConnectionManager {
+    
     fn new(server_name: String, server_port: u16) -> Result<Self> {
         let provider = Arc::new(rustls_openssl::default_provider());
         let roots = rustls::RootCertStore {
@@ -382,17 +390,17 @@ impl ConnectionManager {
         Ok(Self {
             endpoint,
             server_name,
-            server_ip: None,
+            // server_ip: None,
             server_port,
             bootstrap_dns: None,
             connection: Arc::new(RwLock::new(None)),
-            // force_reconnect: AtomicBool::new(false),
             connecting: AtomicBool::new(false),
+            server_addrs: None,
         })
     }
 
     fn with_server_ip(mut self, ip: Vec<IpAddr>) -> Self {
-        self.server_ip = Some(ip);
+        self.server_addrs = Some(Arc::new(ip.into_iter().map(|ip| SocketAddr::new(ip, self.server_port)).collect()));
         self
     }
 
@@ -410,6 +418,7 @@ impl ConnectionManager {
         }
     }
 
+    #[inline(always)]
     fn is_connecting(&self) -> bool {
         self.connecting.load(Ordering::Relaxed)
     }
@@ -446,15 +455,14 @@ impl ConnectionManager {
             return Ok(conn.clone());
         }
 
-        let remote_ips = if let Some(ip) = self.server_ip.clone() {
-            ip
+        let remote_addrs = if let Some(addrs) = &self.server_addrs {
+            addrs.clone()
         } else {
-            resolve_upstream_addr(&self.server_name, self.bootstrap_dns).await?
+            self.resolve_upstream_addr().await?
         };
 
-        for remote_ip in remote_ips.clone() {
-            let remote_addr = SocketAddr::new(remote_ip, self.server_port);
-
+        for &remote_addr in remote_addrs.iter() {
+            debug!("Attempting to connect to DoQ server at {}", remote_addr);
             match timeout(Duration::from_secs(3), self.connect_to(remote_addr)).await {
                 Ok(Ok(connection)) => {
                     info!("Connected to DoQ server at {}", remote_addr);
@@ -471,8 +479,7 @@ impl ConnectionManager {
         }
 
         Err(anyhow::anyhow!(
-            "Failed to connect to any resolved IP addresses: {:?}",
-            remote_ips
+            "Failed to connect to any resolved IP addresses"
         ))
     }
 
@@ -487,6 +494,7 @@ impl ConnectionManager {
 
         // Validate connection is open and functional
         if let Some(close_reason) = connection.close_reason() {
+            cold_path();
             return Err(anyhow::anyhow!(
                 "Connection closed immediately after establishment: {:?}",
                 close_reason
@@ -508,40 +516,40 @@ impl ConnectionManager {
         );
         Ok(connection)
     }
-}
 
-async fn resolve_upstream_addr(
-    host: &str,
-    bootstrap_dns: Option<SocketAddr>,
-) -> Result<Vec<IpAddr>> {
-    let server = bootstrap_dns.unwrap_or_else(|| "1.1.1.1:53".parse().unwrap());
-    let resolver = RESOLVER.get_or_try_init(move || {
-        let mut udp = ConnectionConfig::udp();
-        udp.port = server.port();
-        let ns = NameServerConfig::new(server.ip(), true, vec![udp]);
+    async fn resolve_upstream_addr(&self) -> Result<Arc<Vec<SocketAddr>>> {
+        let server = self
+            .bootstrap_dns
+            .unwrap_or_else(|| "1.1.1.1:53".parse().unwrap());
+        let resolver = RESOLVER.get_or_try_init(move || {
+            let mut udp = ConnectionConfig::udp();
+            udp.port = server.port();
+            let ns = NameServerConfig::new(server.ip(), true, vec![udp]);
 
-        Resolver::builder_with_config(
-            ResolverConfig::from_parts(None, vec![], vec![ns]),
-            TokioRuntimeProvider::default(),
-        )
-        .build()
-        .context("failed to build bootstrap resolver")
-    })?;
+            Resolver::builder_with_config(
+                ResolverConfig::from_parts(None, vec![], vec![ns]),
+                TokioRuntimeProvider::default(),
+            )
+            .build()
+            .context("failed to build bootstrap resolver")
+        })?;
 
-    let response = resolver
-        .lookup_ip(host)
-        .await
-        .context("can not resolve upstream ip")?;
+        let response = resolver
+            .lookup_ip(&self.server_name)
+            .await
+            .context("can not resolve upstream ip")?;
 
-    let ips: Vec<IpAddr> = response.iter().collect();
-    if ips.is_empty() {
-        Err(anyhow::anyhow!(
-            "No IP addresses found for {} with resolver {:?}",
-            host,
-            server
-        ))
-    } else {
-        Ok(ips)
+        let ips: Vec<SocketAddr> = response.iter().map(|ip| SocketAddr::new(ip, self.server_port)).collect();
+        if ips.is_empty() {
+            cold_path();
+            Err(anyhow::anyhow!(
+                "No IP addresses found for {} with resolver {:?}",
+                self.server_name,
+                server
+            ))
+        } else {
+            Ok(Arc::new(ips))
+        }
     }
 }
 
@@ -563,6 +571,7 @@ async fn send_servfail(query: &Message, socket: &UdpSocket, src_addr: SocketAddr
             }
         }
         Err(e) => {
+            cold_path();
             warn!("Failed to encode SERVFAIL response: {}", e);
         }
     }
@@ -573,6 +582,7 @@ async fn send_servfail_raw(query_data: &[u8], socket: &UdpSocket, src_addr: Sock
     if let Ok(query) = Message::from_vec(query_data) {
         send_servfail(&query, socket, src_addr).await;
     } else {
+        cold_path();
         warn!(
             "Failed to parse query for SERVFAIL, cannot respond to {}",
             src_addr
