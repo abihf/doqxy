@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use bytes::{Bytes, BytesMut};
 use hickory_proto::{
     op::{Message, MessageType, ResponseCode},
     serialize::binary::BinEncodable,
@@ -12,6 +13,7 @@ use moka::future::Cache;
 use once_cell::sync::OnceCell;
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::WebPkiServerVerifier;
+use rustls_native_certs::load_native_certs;
 use std::{
     hint::cold_path,
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -20,6 +22,7 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
+    vec,
 };
 use tokio::{net::UdpSocket, sync::RwLock, time::timeout};
 use tracing::{debug, error, info, warn};
@@ -46,7 +49,7 @@ async fn main() -> Result<()> {
 
 struct DnsProxy {
     manager: Arc<ConnectionManager>,
-    cache: Arc<Cache<Vec<u8>, Vec<u8>>>,
+    cache: Arc<Cache<Bytes, Bytes>>,
     socket: Arc<UdpSocket>,
     debug_mode: bool,
     timeout_count: Arc<AtomicUsize>,
@@ -90,7 +93,7 @@ impl DnsProxy {
         info!("Connection manager initialized");
 
         // Create DNS response cache
-        let cache: Cache<Vec<u8>, Vec<u8>> = Cache::builder()
+        let cache: Cache<Bytes, Bytes> = Cache::builder()
             .max_capacity(CACHE_MAX_CAPACITY)
             .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
             .build();
@@ -123,11 +126,11 @@ impl DnsProxy {
         loop {
             match proxy.socket.recv_from(&mut buf).await {
                 Ok((len, src_addr)) => {
-                    let query_data = buf[..len].to_vec();
+                    let query_data = Bytes::copy_from_slice(&buf[..len]);
                     let proxy = Arc::clone(&proxy);
 
                     tokio::spawn(async move {
-                        proxy.handle_query(&query_data, src_addr).await;
+                        proxy.handle_query(query_data, src_addr).await;
                     });
                 }
                 Err(e) => {
@@ -157,15 +160,15 @@ impl DnsProxy {
         });
     }
 
-    async fn handle_query(&self, query_data: &[u8], src_addr: SocketAddr) {
+    async fn handle_query(&self, query_data: Bytes, src_addr: SocketAddr) {
         if self.debug_mode {
             cold_path();
             // Parse query for debugging
-            if let Ok(query) = Message::from_vec(query_data) {
+            if let Ok(query) = Message::from_vec(&query_data) {
                 info!("Received query from {}: {:?}", src_addr, query.queries);
             } else {
                 error!("Received invalid DNS query from {}", src_addr);
-                send_servfail_raw(query_data, &self.socket, src_addr).await;
+                send_servfail_raw(&query_data, &self.socket, src_addr).await;
                 return;
             }
         }
@@ -173,7 +176,7 @@ impl DnsProxy {
         if query_data.len() <= 12 {
             cold_path();
             error!("Received DNS query too short from {}", src_addr);
-            send_servfail_raw(query_data, &self.socket, src_addr).await;
+            send_servfail_raw(&query_data, &self.socket, src_addr).await;
             return;
         }
 
@@ -181,14 +184,16 @@ impl DnsProxy {
         let query_id = &query_data[0..2];
 
         // Create cache key from question section (skip 12-byte header)
-        let cache_key = &query_data[12..];
+        let cache_key = query_data.slice(12..);
 
         // Check cache
-        if let Some(mut cached_response) = self.cache.get(cache_key).await {
+        if let Some(cached_response) = self.cache.get(&cache_key).await {
+            let mut response_buf = BytesMut::from(cached_response.as_ref());
+
             // Replace response ID with query ID
-            if cached_response.len() >= 2 {
-                cached_response[0] = query_id[0];
-                cached_response[1] = query_id[1];
+            if response_buf.len() >= 2 {
+                response_buf[0] = query_id[0];
+                response_buf[1] = query_id[1];
             }
 
             if self.debug_mode {
@@ -196,7 +201,7 @@ impl DnsProxy {
                 info!("Cache HIT for query from {}", src_addr);
             }
 
-            if let Err(e) = self.socket.send_to(&cached_response, src_addr).await {
+            if let Err(e) = self.socket.send_to(&response_buf, src_addr).await {
                 cold_path();
                 error!("Failed to send cached response to client: {}", e);
             }
@@ -218,7 +223,7 @@ impl DnsProxy {
         let start_time = Instant::now();
 
         // Process query and send response (or SERVFAIL on error)
-        match timeout(Duration::from_secs(5), self.process_query(query_data)).await {
+        match timeout(Duration::from_secs(5), self.process_query(&query_data)).await {
             Ok(Ok(response_buf)) => {
                 self.timeout_count.store(0, Ordering::Relaxed);
                 if self.debug_mode {
@@ -234,7 +239,7 @@ impl DnsProxy {
                         }
                         Err(e) => {
                             error!("Received invalid DNS response from upstream: {}", e);
-                            send_servfail_raw(query_data, &self.socket, src_addr).await;
+                            send_servfail_raw(&query_data, &self.socket, src_addr).await;
                             return;
                         }
                     }
@@ -246,17 +251,17 @@ impl DnsProxy {
                 }
 
                 // Cache the response (with original query ID)
-                self.cache.insert(cache_key.to_vec(), response_buf).await;
+                self.cache.insert(cache_key, response_buf).await;
             }
             Ok(Err(e)) => {
                 cold_path();
                 self.timeout_count.store(0, Ordering::Relaxed);
                 error!("Error processing query: {}", e);
-                send_servfail_raw(query_data, &self.socket, src_addr).await;
+                send_servfail_raw(&query_data, &self.socket, src_addr).await;
             }
             Err(_) => {
                 warn!("Query timeout after 5 seconds for {}", src_addr);
-                send_servfail_raw(query_data, &self.socket, src_addr).await;
+                send_servfail_raw(&query_data, &self.socket, src_addr).await;
 
                 // Only count timeouts from the current connection epoch.
                 // Stale timeouts from queries that were in flight during a previous
@@ -278,7 +283,7 @@ impl DnsProxy {
         }
     }
 
-    async fn process_query(&self, query_data: &[u8]) -> Result<Vec<u8>> {
+    async fn process_query(&self, query_data: &[u8]) -> Result<Bytes> {
         // Get connection (will reconnect if needed)
         let connection = self.manager.get_connection().await?;
 
@@ -315,7 +320,7 @@ impl DnsProxy {
             .await
             .context("Failed to read DNS response")?;
 
-        Ok(response_buf)
+        Ok(Bytes::from_owner(response_buf))
     }
 }
 
@@ -360,13 +365,17 @@ struct ConnectionManager {
 impl ConnectionManager {
     fn new(server_name: String, server_port: u16) -> Result<Self> {
         let provider = Arc::new(rustls_openssl::default_provider());
-        let roots = rustls::RootCertStore {
-            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-        };
-        let roots = Arc::new(roots);
-        let verifier = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
-            .build()
-            .context("can not create webpki verifier")?;
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in load_native_certs().expect("could not load CA certificates") {
+            roots.add(cert).context("failed to add native cert")?;
+        }
+
+        let verifier =
+            WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                .build()
+                .context("can not create webpki verifier")?;
+
         let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()?
             .with_webpki_verifier(verifier)
