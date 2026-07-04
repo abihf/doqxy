@@ -218,7 +218,7 @@ impl DnsProxy {
         let start_time = Instant::now();
 
         // Process query and send response (or SERVFAIL on error)
-        match timeout(Duration::from_secs(5), self.process_query(&query_data)).await {
+        match timeout(Duration::from_secs(5), self.process_query(query_data)).await {
             Ok(Ok(response_buf)) => {
                 self.timeout_count.store(0, Ordering::Relaxed);
                 if self.debug_mode {
@@ -234,7 +234,7 @@ impl DnsProxy {
                         }
                         Err(e) => {
                             error!("Received invalid DNS response from upstream: {}", e);
-                            send_servfail_raw(&query_data, &self.socket, src_addr).await;
+                            send_servfail_raw(query_data, &self.socket, src_addr).await;
                             return;
                         }
                     }
