@@ -9,7 +9,7 @@ use hickory_resolver::{
     config::{ConnectionConfig, NameServerConfig, ResolverConfig},
     net::runtime::TokioRuntimeProvider,
 };
-use moka::future::Cache;
+use moka::sync::Cache;
 use once_cell::sync::OnceCell;
 use quinn::{ClientConfig, Connection, Endpoint};
 use rustls::client::WebPkiServerVerifier;
@@ -24,12 +24,15 @@ use std::{
     time::{Duration, Instant},
     vec,
 };
-use tokio::{net::UdpSocket, sync::RwLock, time::timeout};
+use tokio::{
+    net::UdpSocket,
+    sync::{Notify, RwLock},
+    time::timeout,
+};
 use tracing::{debug, error, info, warn};
 
 const BUFFER_SIZE: usize = 4096;
 const CACHE_MAX_CAPACITY: u64 = 10000;
-const CACHE_TTL_SECS: u64 = 300; // 5 minutes
 
 static RESOLVER: OnceCell<Resolver<TokioRuntimeProvider>> = OnceCell::new();
 
@@ -43,8 +46,7 @@ async fn main() -> Result<()> {
     if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Ready]) {
         warn!("Failed to notify systemd readiness: {}", err);
     }
-    proxy.run().await;
-    Ok(())
+    proxy.run().await
 }
 
 struct DnsProxy {
@@ -55,6 +57,8 @@ struct DnsProxy {
     timeout_count: Arc<AtomicUsize>,
     force_reconnect: Arc<AtomicBool>,
     connection_epoch: Arc<AtomicUsize>,
+    in_flight: Arc<AtomicUsize>,
+    in_flight_drained: Arc<Notify>,
 }
 
 impl DnsProxy {
@@ -72,35 +76,43 @@ impl DnsProxy {
         // Create connection manager
         let mut manager = ConnectionManager::new(upstream_server, upstream_port)?;
         if let Ok(ips_string) = std::env::var("UPSTREAM_IP") {
-            let ips: Vec<IpAddr> = ips_string
+            let addrs: Vec<SocketAddr> = ips_string
                 .split(',')
                 .map(|raw_str| {
                     let ip_str = raw_str.trim();
-                    ip_str
-                        .parse()
-                        .context(format!("can not parse IP address {}", ip_str))
-                        .unwrap()
+                    SocketAddr::new(
+                        ip_str
+                            .parse()
+                            .context(format!("can not parse IP address {}", ip_str))
+                            .unwrap(),
+                        upstream_port,
+                    )
                 })
                 .collect();
-            manager = manager.with_server_ip(ips);
+            manager.with_server_addrs(addrs);
         }
         if let Ok(bootstrap_dns) = std::env::var("BOOTSTRAP_DNS") {
             let addr: SocketAddr = bootstrap_dns
                 .parse()
                 .context("Invalid BOOTSTRAP_DNS format")?;
-            manager = manager.with_bootstrap_dns(addr);
+            manager.with_bootstrap_dns(addr);
         }
         info!("Connection manager initialized");
+
+        let ttl = std::env::var("CACHE_TTL")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(300);
 
         // Create DNS response cache
         let cache: Cache<Bytes, Bytes> = Cache::builder()
             .max_capacity(CACHE_MAX_CAPACITY)
-            .time_to_live(Duration::from_secs(CACHE_TTL_SECS))
+            .time_to_live(Duration::from_secs(ttl))
             .build();
 
         info!(
             "Cache initialized: max {} entries, TTL {}s",
-            CACHE_MAX_CAPACITY, CACHE_TTL_SECS
+            CACHE_MAX_CAPACITY, ttl
         );
 
         // Create UDP socket for receiving DNS queries
@@ -117,28 +129,75 @@ impl DnsProxy {
             timeout_count: Arc::new(AtomicUsize::new(0)),
             force_reconnect: Arc::new(AtomicBool::new(false)),
             connection_epoch: Arc::new(AtomicUsize::new(0)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
+            in_flight_drained: Arc::new(Notify::new()),
         })
     }
 
-    async fn run(self) {
+    async fn run(self) -> Result<()> {
         let proxy = Arc::new(self);
         let mut buf = [0u8; BUFFER_SIZE];
-        loop {
-            match proxy.socket.recv_from(&mut buf).await {
-                Ok((len, src_addr)) => {
-                    let query_data = Bytes::copy_from_slice(&buf[..len]);
-                    let proxy = Arc::clone(&proxy);
+        let shutdown = shutdown_signal();
+        tokio::pin!(shutdown);
 
-                    tokio::spawn(async move {
-                        proxy.handle_query(query_data, src_addr).await;
-                    });
+        loop {
+            tokio::select! {
+                signal = &mut shutdown => {
+                    signal?;
+                    info!("Shutdown requested; no longer accepting DNS queries");
+                    if let Err(err) = sd_notify::notify(&[sd_notify::NotifyState::Stopping]) {
+                        warn!("Failed to notify systemd shutdown: {}", err);
+                    }
+                    break;
                 }
-                Err(e) => {
-                    cold_path();
-                    error!("Error receiving UDP packet: {}", e);
-                }
+                result = proxy.socket.recv_from(&mut buf) => match result {
+                    Ok((len, src_addr)) => {
+                        if len <= 12 {
+                            cold_path();
+                            error!("Received DNS query too short from {}", src_addr);
+                            continue;
+                        }
+
+                        // Keep the common localhost cache-hit path in the receive
+                        // loop: no task allocation and no await before the next recv.
+                        if is_cacheable_query(&buf[..len]) {
+                            if proxy.handle_from_cache(&buf[..len], src_addr) {
+                                continue;
+                            }
+                        } else {
+                            cold_path();
+                            debug!("Received non-cacheable query from {}", src_addr);
+                        }
+
+                        let in_flight = InFlightGuard::new(
+                            Arc::clone(&proxy.in_flight),
+                            Arc::clone(&proxy.in_flight_drained),
+                        );
+                        let query_data = Bytes::copy_from_slice(&buf[..len]);
+                        let proxy = Arc::clone(&proxy);
+                        tokio::spawn(async move {
+                            let _in_flight = in_flight;
+                            proxy.handle_query(query_data, src_addr).await;
+                        });
+                    }
+                    Err(e) => {
+                        cold_path();
+                        error!("Error receiving UDP packet: {}", e);
+                    }
+                },
             }
         }
+
+        // Query handlers have their own five-second upstream timeout. Let them finish
+        // so clients receive either their response or SERVFAIL before closing QUIC.
+        match timeout(Duration::from_secs(5), proxy.wait_for_in_flight()).await {
+            Ok(()) => info!("All in-flight DNS queries completed"),
+            Err(_) => warn!("Shutdown grace period elapsed; closing upstream connection"),
+        }
+
+        proxy.manager.shutdown();
+        info!("DNS proxy stopped");
+        Ok(())
     }
 
     async fn ensure_connection_background(&self) {
@@ -160,6 +219,51 @@ impl DnsProxy {
         });
     }
 
+    async fn wait_for_in_flight(&self) {
+        while self.in_flight.load(Ordering::Acquire) != 0 {
+            self.in_flight_drained.notified().await;
+        }
+    }
+
+    fn handle_from_cache(&self, query_data: &[u8], src_addr: SocketAddr) -> bool {
+        let cached_response = match self.cache.get(&query_data[12..]) {
+            Some(response) => response,
+            None => return false,
+        };
+
+        if cached_response.len() < 2 {
+            cold_path();
+            error!("Ignoring cached DNS response shorter than its transaction ID");
+            return false;
+        }
+        let mut response = BytesMut::from(cached_response.as_ref());
+        drop(cached_response);
+
+        response[..2].copy_from_slice(&query_data[..2]);
+        match self.socket.try_send_to(&response, src_addr) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let in_flight = InFlightGuard::new(
+                    Arc::clone(&self.in_flight),
+                    Arc::clone(&self.in_flight_drained),
+                );
+                let socket = Arc::clone(&self.socket);
+                tokio::spawn(async move {
+                    let _in_flight = in_flight;
+                    if let Err(e) = socket.send_to(&response, src_addr).await {
+                        cold_path();
+                        error!("Failed to send cached response to client: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                cold_path();
+                error!("Failed to send cached response to client: {}", e);
+            }
+        }
+        true
+    }
+
     async fn handle_query(&self, query_data: Bytes, src_addr: SocketAddr) {
         if self.debug_mode {
             cold_path();
@@ -171,46 +275,6 @@ impl DnsProxy {
                 send_servfail_raw(&query_data, &self.socket, src_addr).await;
                 return;
             }
-        }
-
-        if query_data.len() <= 12 {
-            cold_path();
-            error!("Received DNS query too short from {}", src_addr);
-            send_servfail_raw(&query_data, &self.socket, src_addr).await;
-            return;
-        }
-
-        // Extract query ID to restore later
-        let query_id = &query_data[0..2];
-
-        // Create cache key from question section (skip 12-byte header)
-        let cache_key = query_data.slice(12..);
-
-        // Check cache
-        if let Some(cached_response) = self.cache.get(&cache_key).await {
-            let mut response_buf = BytesMut::from(cached_response.as_ref());
-
-            // Replace response ID with query ID
-            if response_buf.len() >= 2 {
-                response_buf[0] = query_id[0];
-                response_buf[1] = query_id[1];
-            }
-
-            if self.debug_mode {
-                cold_path();
-                info!("Cache HIT for query from {}", src_addr);
-            }
-
-            if let Err(e) = self.socket.send_to(&response_buf, src_addr).await {
-                cold_path();
-                error!("Failed to send cached response to client: {}", e);
-            }
-            return;
-        }
-
-        if self.debug_mode {
-            cold_path();
-            info!("Cache MISS for query from {}", src_addr);
         }
 
         // Capture the epoch before submitting the query. If the connection is
@@ -250,8 +314,11 @@ impl DnsProxy {
                     error!("Failed to send response to client: {}", e);
                 }
 
-                // Cache the response (with original query ID)
-                self.cache.insert(cache_key, response_buf).await;
+                // Cache only ordinary recursive queries. Diagnostic and DNSSEC
+                // control queries bypass the cache to preserve their semantics.
+                if is_cacheable_query(&query_data) {
+                    self.cache.insert(query_data.slice(12..), response_buf);
+                }
             }
             Ok(Err(e)) => {
                 cold_path();
@@ -321,6 +388,34 @@ impl DnsProxy {
             .context("Failed to read DNS response")?;
 
         Ok(Bytes::from_owner(response_buf))
+    }
+}
+
+/// Returns true only for the ordinary recursive DNS queries issued by local
+/// browsers and applications: QUERY opcode, RD set, and no other flag bits.
+/// Such requests can safely share the raw question-section cache key.
+#[inline]
+fn is_cacheable_query(query_data: &[u8]) -> bool {
+    query_data[2] == 0x01 && query_data[3] == 0x00
+}
+
+struct InFlightGuard {
+    count: Arc<AtomicUsize>,
+    drained: Arc<Notify>,
+}
+
+impl InFlightGuard {
+    fn new(count: Arc<AtomicUsize>, drained: Arc<Notify>) -> Self {
+        count.fetch_add(1, Ordering::Relaxed);
+        Self { count, drained }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self.count.fetch_sub(1, Ordering::Release) == 1 {
+            self.drained.notify_one();
+        }
     }
 }
 
@@ -407,18 +502,12 @@ impl ConnectionManager {
         })
     }
 
-    fn with_server_ip(mut self, ip: Vec<IpAddr>) -> Self {
-        self.server_addrs = Some(Arc::new(
-            ip.into_iter()
-                .map(|ip| SocketAddr::new(ip, self.server_port))
-                .collect(),
-        ));
-        self
+    fn with_server_addrs(&mut self, addrs: Vec<SocketAddr>) {
+        self.server_addrs = Some(Arc::new(addrs));
     }
 
-    fn with_bootstrap_dns(mut self, addr: SocketAddr) -> Self {
+    fn with_bootstrap_dns(&mut self, addr: SocketAddr) {
         self.bootstrap_dns = Some(addr);
-        self
     }
 
     async fn is_connected(&self) -> bool {
@@ -451,6 +540,10 @@ impl ConnectionManager {
         }
         drop(conn_guard);
         return self.connect(false).await;
+    }
+
+    fn shutdown(&self) {
+        self.endpoint.close(0u32.into(), b"server shutting down");
     }
 
     async fn connect(&self, force: bool) -> Result<Connection> {
@@ -568,6 +661,19 @@ impl ConnectionManager {
     }
 }
 
+async fn shutdown_signal() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut terminate = signal(SignalKind::terminate()).context("Failed to listen for SIGTERM")?;
+    let mut interrupt = signal(SignalKind::interrupt()).context("Failed to listen for SIGINT")?;
+    tokio::select! {
+        _ = terminate.recv() => info!("Received SIGTERM"),
+        _ = interrupt.recv() => info!("Received SIGINT"),
+    }
+
+    Ok(())
+}
+
 async fn send_servfail(query: &Message, socket: &UdpSocket, src_addr: SocketAddr) {
     // Create SERVFAIL response
     let mut response = Message::new(query.id, MessageType::Response, query.op_code);
@@ -617,5 +723,30 @@ fn set_flag_guard<'a>(flag: &'a AtomicBool) -> BoolGuard<'a> {
 impl<'a> Drop for BoolGuard<'a> {
     fn drop(&mut self) {
         self.flag.store(false, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_cacheable_query;
+
+    #[test]
+    fn caches_only_standard_recursive_queries() {
+        let mut query = [0_u8; 13];
+        query[2] = 0x01; // RD
+        assert!(is_cacheable_query(&query));
+
+        query[2] = 0x00; // RD is absent
+        assert!(!is_cacheable_query(&query));
+
+        query[2] = 0x09; // QUERY with TC set
+        assert!(!is_cacheable_query(&query));
+
+        query[2] = 0x11; // non-QUERY opcode
+        assert!(!is_cacheable_query(&query));
+
+        query[2] = 0x01;
+        query[3] = 0x10; // CD
+        assert!(!is_cacheable_query(&query));
     }
 }
